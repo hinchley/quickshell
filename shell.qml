@@ -46,6 +46,7 @@ ShellRoot {
   property string wlanInterface: "wlan0"
 
   readonly property string scriptDir: Quickshell.shellDir + "/scripts"
+  readonly property string hyprConfig: Quickshell.env("HOME") + "/.config/hypr/hyprland.lua"
 
   // =========================================================================
   // 2. State Management Definitions
@@ -59,16 +60,25 @@ ShellRoot {
   property real lastCpuIdle: 0
   property real lastCpuTotal: 0
 
+  // Ticks at the start of every minute (and on timezone / wall-clock changes),
+  // so anything bound to clock.date never goes stale.
+  SystemClock {
+    id: clock
+    precision: SystemClock.Minutes
+  }
+
+  property bool barVisible: true
   property bool calendarOpen: false
-  property date calendarBaseDate: new Date()
-  property int calendarMonth: calendarBaseDate.getMonth()
-  property int calendarYear: calendarBaseDate.getFullYear()
+  property int calendarMonth: clock.date.getMonth()
+  property int calendarYear: clock.date.getFullYear()
 
   property string netType: ""
   property string netName: ""
 
-  property bool launcherOpen: false
-  property string launcherQuery: ""
+  // Only one overlay (launcher / keybinds) is shown at a time.
+  property string overlay: ""
+  readonly property bool launcherOpen: overlay === "launcher"
+  readonly property bool keybindsOpen: overlay === "keybinds"
 
   property var launcherWhitelist: []
   property var launcherBlacklist: [
@@ -88,6 +98,8 @@ ShellRoot {
     "XTerm"
   ]
 
+  property var keybindList: []
+
   // =========================================================================
   // 3. UI Reusable Building Blocks
   // =========================================================================
@@ -97,34 +109,315 @@ ShellRoot {
     color: root.colFg
   }
 
+  // Standard Panel Capsule Item
+  component Pill: Rectangle {
+    id: pill
+    default property alias content: pillLayout.children
+    property real spacing: 4
+    property real sidePadding: 30
+    property alias mouse: pillMouseArea
+
+    color: root.colPill
+    radius: 12
+    implicitHeight: 28
+    border.color: root.colBorderFaint
+    border.width: 1
+    implicitWidth: pillLayout.implicitWidth + sidePadding
+
+    RowLayout {
+      id: pillLayout
+      spacing: pill.spacing
+      anchors {
+        fill: parent
+        leftMargin: pill.sidePadding / 2
+        rightMargin: pill.sidePadding / 2
+      }
+    }
+
+    MouseArea {
+      id: pillMouseArea
+      anchors.fill: parent
+      enabled: false
+    }
+  }
+
+  component MetricPill: Pill {
+    id: metricPill
+    property string label
+    property color labelColor: root.colFg
+    signal clicked()
+
+    mouse.enabled: true
+    mouse.cursorShape: Qt.PointingHandCursor
+    mouse.onClicked: clicked()
+
+    BarText {
+      text: metricPill.label
+      color: metricPill.labelColor
+      font.bold: true
+    }
+  }
+
+  // Runs a TUI in a foot window; clicking again while it is open is a no-op.
+  component TuiProcess: Process {
+    required property string appId
+    required property var program
+    command: ["foot", "--app-id=org.hinchley." + appId, "-e"].concat(program)
+  }
+
+  // Full-screen overlay holding a search box and a filtered list. The parent
+  // supplies the already-filtered `entries`; each row shows entry[primaryRole]
+  // and, optionally, entry[secondaryRole] beside it.
+  // qmllint disable uncreatable-type
+  component PickerWindow: PanelWindow {
+    // qmllint enable uncreatable-type
+    id: picker
+
+    property bool open: false
+    property string placeholder: ""
+    property var entries: []
+    property string primaryRole: "name"
+    property string secondaryRole: ""
+    property real primaryWidth: 0        // 0 = primary text fills the row
+    property real panelWidth: 560
+    property real panelHeight: 420
+    property alias query: input.text
+
+    signal activated(var entry)
+    signal dismissed()
+
+    visible: open
+
+    // Native Wayland Layer Shell specifications for Quickshell 0.3.x
+    WlrLayershell.layer: WlrLayer.Overlay
+    focusable: true
+    color: "transparent"
+    anchors {
+      top: true
+      bottom: true
+      left: true
+      right: true
+    }
+
+    onVisibleChanged: {
+      if (!visible) return;
+      input.text = "";
+      input.forceActiveFocus();
+    }
+
+    function activateSelected() {
+      if (list.currentIndex >= 0) picker.activated(filtered.values[list.currentIndex]);
+    }
+
+    // Full-screen click-dismiss
+    MouseArea {
+      anchors.fill: parent
+      onClicked: picker.dismissed()
+    }
+
+    Rectangle {
+      anchors.centerIn: parent
+      width: picker.panelWidth
+      height: picker.panelHeight
+      color: root.colPill
+      radius: 10
+      border.color: root.colBorderStrong
+      border.width: 1
+
+      // Swallow clicks so they don't reach the dismiss area behind
+      MouseArea {
+        anchors.fill: parent
+      }
+
+      ColumnLayout {
+        anchors.fill: parent
+        anchors.margins: 14
+        spacing: 10
+
+        Rectangle {
+          Layout.fillWidth: true
+          Layout.preferredHeight: 42
+          radius: 10
+          color: root.colFillInput
+          border.color: input.activeFocus ? root.colCyan : root.colBorderMed
+          border.width: 1
+
+          TextField {
+            id: input
+            anchors.fill: parent
+            anchors.leftMargin: 12
+            anchors.rightMargin: 12
+            placeholderText: picker.placeholder
+            color: root.colFg
+            placeholderTextColor: root.colMuted
+            selectionColor: root.colCyan
+            selectedTextColor: root.colBg
+            font.family: root.fontFamily
+            font.pixelSize: root.fontSize + 3
+            padding: 0
+            verticalAlignment: TextInput.AlignVCenter
+            background: null
+
+            Keys.onEscapePressed: picker.dismissed()
+            Keys.onPressed: event => {
+              var ctrl = event.modifiers & Qt.ControlModifier;
+              if (event.key === Qt.Key_Up || (event.key === Qt.Key_P && ctrl)) {
+                event.accepted = true;
+                if (list.currentIndex > 0) list.currentIndex--;
+              } else if (event.key === Qt.Key_Down || (event.key === Qt.Key_N && ctrl)) {
+                event.accepted = true;
+                if (list.currentIndex < list.count - 1) list.currentIndex++;
+              } else if (event.key === Qt.Key_PageUp || event.key === Qt.Key_PageDown) {
+                event.accepted = true;
+                var page = Math.max(1, Math.floor(list.height / (list.currentItem?.height || 36)) - 1);
+                var target = list.currentIndex + (event.key === Qt.Key_PageUp ? -page : page);
+                list.currentIndex = Math.max(0, Math.min(list.count - 1, target));
+              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                event.accepted = true;
+                picker.activateSelected();
+              } else if (event.key === Qt.Key_C && ctrl) {
+                event.accepted = true;
+                picker.dismissed();
+              }
+            }
+          }
+        }
+
+        ScriptModel {
+          id: filtered
+          values: picker.entries
+          onValuesChanged: Qt.callLater(() => list.currentIndex = list.count > 0 ? 0 : -1)
+        }
+
+        ListView {
+          id: list
+          Layout.fillWidth: true
+          Layout.fillHeight: true
+          clip: true
+          model: filtered
+          currentIndex: count > 0 ? 0 : -1
+          boundsBehavior: Flickable.StopAtBounds
+          highlightMoveDuration: 80
+          highlight: Rectangle {
+            radius: 8
+            color: Qt.rgba(root.colCyan.r, root.colCyan.g, root.colCyan.b, 0.18)
+            border.color: Qt.rgba(root.colCyan.r, root.colCyan.g, root.colCyan.b, 0.28)
+            border.width: 1
+          }
+
+          delegate: Item {
+            id: row
+            required property var modelData
+            required property int index
+            readonly property bool current: ListView.isCurrentItem
+            width: ListView.view.width
+            height: picker.secondaryRole === "" ? 46 : Math.max(36, secondary.implicitHeight + 16)
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: list.currentIndex = row.index
+              onDoubleClicked: picker.activateSelected()
+            }
+
+            RowLayout {
+              anchors {
+                fill: parent
+                leftMargin: 12
+                rightMargin: 12
+              }
+              spacing: 16
+
+              BarText {
+                Layout.fillWidth: picker.primaryWidth === 0
+                Layout.preferredWidth: picker.primaryWidth > 0 ? picker.primaryWidth : -1
+                text: row.modelData[picker.primaryRole] ?? ""
+                color: (row.current || picker.secondaryRole !== "") ? root.colCyan : root.colFg
+                font.pixelSize: root.fontSize + 1
+                font.bold: row.current
+                elide: Text.ElideRight
+                maximumLineCount: 1
+              }
+
+              BarText {
+                id: secondary
+                visible: picker.secondaryRole !== ""
+                Layout.fillWidth: true
+                text: row.modelData[picker.secondaryRole] ?? ""
+                color: row.modelData.muted ? root.colMuted : root.colFg
+                font.pixelSize: root.fontSize + 1
+                font.bold: row.current
+                wrapMode: Text.Wrap
+                maximumLineCount: 2
+                elide: Text.ElideRight
+              }
+            }
+          }
+        }
+
+        BarText {
+          visible: picker.entries.length === 0
+          Layout.fillWidth: true
+          text: "No matches"
+          color: root.colMuted
+          horizontalAlignment: Text.AlignHCenter
+          font.bold: true
+        }
+      }
+    }
+  }
+
   // =========================================================================
   // 4. Engine & Context Evaluation Methods
   // =========================================================================
   function toggleCalendar() {
     calendarOpen = !calendarOpen;
-    if (calendarOpen) calendarBaseDate = new Date();
+    if (calendarOpen) showCalendarMonth(clock.date.getFullYear(), clock.date.getMonth());
   }
 
   function closeCalendar() {
     calendarOpen = false;
   }
 
-  function generateCalendarDays(year, month) {
+  function showCalendarMonth(year, month) {
+    // Normalises overflow, e.g. (2026, 12) -> January 2027.
+    var first = new Date(year, month, 1);
+    calendarYear = first.getFullYear();
+    calendarMonth = first.getMonth();
+  }
+
+  // 6 weeks of days starting on the Monday on/before the 1st. `now` is passed
+  // in (rather than read here) so the caller's binding re-runs when the day changes.
+  function generateCalendarDays(year, month, now) {
     var days = [];
-    var first = new Date(year, month, 1).getDay();
-    var index = first === 0 ? 6 : first - 1;
-    var today = new Date().toDateString();
+    var offset = (new Date(year, month, 1).getDay() + 6) % 7; // Monday = 0
 
     for (var i = 0; i < 42; i++) {
-      var date = new Date(year, month, 1 - index + i);
+      var date = new Date(year, month, 1 - offset + i);
       days.push({
         day: date.getDate(),
         month: date.getMonth() === month,
-        today: date.toDateString() === today
+        today: date.getFullYear() === now.getFullYear()
+          && date.getMonth() === now.getMonth()
+          && date.getDate() === now.getDate()
       });
     }
 
     return days;
+  }
+
+  function openOverlay(name) {
+    overlay = name;
+    if (name === "keybinds") keybindProc.running = true; // re-read the config each time
+  }
+
+  function closeOverlay() {
+    overlay = "";
+  }
+
+  function toggleOverlay(name) {
+    if (overlay === name) closeOverlay();
+    else openOverlay(name);
   }
 
   function normalizeText(value) {
@@ -135,6 +428,15 @@ ShellRoot {
       .trim();
   }
 
+  // Score of one token against one normalised string: exact > prefix > word start > substring.
+  function textScore(haystack, token) {
+    if (haystack === token)                      return 120;
+    if (haystack.indexOf(token) === 0)           return 90;
+    if (haystack.indexOf(" " + token) >= 0)      return 70;
+    if (haystack.indexOf(token) >= 0)            return 55;
+    return 0;
+  }
+
   function desktopCommand(entry) {
     return entry?.execString
       ?? entry?.command?.join(" ")
@@ -143,24 +445,17 @@ ShellRoot {
   }
 
   function launcherBlacklistMatches(entry) {
-    if (!launcherBlacklist || launcherBlacklist.length === 0) return false;
-
-    var item = [
+    var haystack = normalizeText([
       entry.name ?? "",
       entry.id ?? "",
       desktopCommand(entry),
-      entry.comment
-      ?? ""
-    ].join(" ")
+      entry.comment ?? ""
+    ].join(" "));
 
-    var haystack = normalizeText(item);
-
-    for (var i = 0; i < launcherBlacklist.length; i++) {
-      var needle = normalizeText(launcherBlacklist[i]);
-      if (needle !== "" && haystack.indexOf(needle) >= 0) return true;
-    }
-
-    return false;
+    return launcherBlacklist.some(item => {
+      var needle = normalizeText(item);
+      return needle !== "" && haystack.indexOf(needle) >= 0;
+    });
   }
 
   function normalizeCommand(command) {
@@ -206,19 +501,14 @@ ShellRoot {
     normCategories: normalizeText((entry.categories ?? []).join(" "))
   }))
 
-  function launcherScore(cached, query) {
-    var q = normalizeText(query);
-    if (q === "") return 1;
-
-    var tokens = q.split(/\s+/).filter(token => token.length > 0);
+  function launcherScore(cached, tokens) {
     var score = 0;
 
     for (var i = 0; i < tokens.length; i++) {
       var token = tokens[i];
-      if (cached.normName === token)                      score += 120;
-      else if (cached.normName.indexOf(token) === 0)      score += 90;
-      else if (cached.normName.indexOf(" " + token) >= 0) score += 70;
-      else if (cached.normName.indexOf(token) >= 0)       score += 55;
+      var nameScore = textScore(cached.normName, token);
+
+      if (nameScore > 0)                                  score += nameScore;
       else if (cached.normCommand.indexOf(token) >= 0)    score += 35;
       else if (cached.normKeywords.indexOf(token) >= 0)   score += 25;
       else if (cached.normCategories.indexOf(token) >= 0) score += 15;
@@ -229,47 +519,105 @@ ShellRoot {
     return score;
   }
 
-  function launcherEntries() {
-    var q = launcherQuery;
-    return launcherBaseCache
+  // Keeps cache items matching every token, best score first. `compare` orders ties.
+  function rankEntries(cache, query, scoreFn, compare) {
+    var tokens = normalizeText(query).split(/\s+/).filter(token => token.length > 0);
+
+    return cache
       .map(cached => ({
-        entry: cached.entry,
-        score: launcherScore(cached, q)
+        cached: cached,
+        score: tokens.length === 0 ? 1 : scoreFn(cached, tokens)
       })).filter(match =>
         match.score >= 0
       ).sort((a, b) =>
-        b.score - a.score ||
-        a.entry.name.localeCompare(b.entry.name)
+        b.score - a.score || compare(a.cached, b.cached)
       ).map(match =>
-        match.entry
+        match.cached.entry
       );
   }
 
-  function openLauncher() {
-    launcherOpen = true;
-    launcherQuery = "";
-    launcherInput.text = "";
-  }
-
-  function closeLauncher() {
-    launcherOpen = false;
-    launcherQuery = "";
-    launcherInput.text = "";
-  }
-
-  function toggleLauncher() {
-    if (launcherOpen) closeLauncher();
-    else openLauncher();
+  function launcherEntries(query) {
+    return rankEntries(launcherBaseCache, query, launcherScore,
+      (a, b) => a.entry.name.localeCompare(b.entry.name));
   }
 
   function launchEntry(entry) {
     if (!entry) return;
-    if (entry.source) { entry.source.execute();
-    } else if ((entry.command ?? "") !== "") {
-      commandLauncher.command = ["sh", "-c", entry.command];
-      commandLauncher.running = true;
+    if (entry.source) entry.source.execute();
+    else if ((entry.command ?? "") !== "") Quickshell.execDetached(["sh", "-c", entry.command]);
+    closeOverlay();
+  }
+
+  // "XF86MonBrightnessUp" -> "Mon Brightness Up", "code:10" -> "1", "mouse:272" -> "Mouse Left".
+  // code:N assumes the US layout configured in hyprland.lua (10-19 = number row).
+  function formatKey(key) {
+    var code = /^code:(\d+)$/.exec(key);
+    if (code) {
+      var n = parseInt(code[1]);
+      if (n >= 10 && n <= 18) return String(n - 9);
+      if (n === 19) return "0";
+      if (n === 20) return "-";
+      if (n === 21) return "=";
+      return key;
     }
-    closeLauncher();
+
+    var mouse = { "mouse:272": "Mouse Left", "mouse:273": "Mouse Right", "mouse:274": "Mouse Middle" };
+    if (mouse[key]) return mouse[key];
+
+    if (key.indexOf("XF86") === 0)
+      return key.substring(4).replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+
+    return key;
+  }
+
+  function formatKeys(combo) {
+    return combo.split("+").map(part => formatKey(part.trim())).join(" + ");
+  }
+
+  // Parses `<keys>\t<description>` lines from scripts/keybinds.lua.
+  function parseKeybinds(text) {
+    return text.split("\n")
+      .filter(line => line.indexOf("\t") > 0)
+      .map(line => {
+        var tab = line.indexOf("\t");
+        var keys = formatKeys(line.substring(0, tab));
+        var description = line.substring(tab + 1).trim();
+        return {
+          entry: {
+            keys: keys,
+            description: description || "(no description)",
+            muted: description === ""
+          },
+          normKeys: normalizeText(keys),
+          normDescription: normalizeText(description),
+          // Natural order: "workspace 2" before "workspace 10"; undescribed last.
+          sortKey: description === ""
+            ? "\uffff"
+            : description.toLowerCase().replace(/\d+/g, n => n.padStart(6, "0"))
+        };
+      });
+  }
+
+  function keybindScore(cached, tokens) {
+    var score = 0;
+
+    for (var i = 0; i < tokens.length; i++) {
+      var token = tokens[i];
+      var keyScore = 0;
+      if ((" " + cached.normKeys + " ").indexOf(" " + token + " ") >= 0) keyScore = 100;
+      else if (cached.normKeys.indexOf(token) >= 0)                      keyScore = 30;
+
+      var best = Math.max(textScore(cached.normDescription, token), keyScore);
+      if (best === 0) return -1;
+      score += best;
+    }
+
+    return score;
+  }
+
+  function keybindEntries(query) {
+    return rankEntries(keybindList, query, keybindScore, (a, b) =>
+      a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : a.entry.keys.localeCompare(b.entry.keys));
   }
 
   // =========================================================================
@@ -326,81 +674,44 @@ ShellRoot {
     return s.length > 40 ? s.substring(0, 38) + "…" : s;
   }
 
+
   // =========================================================================
   // 6. Native Execution Handlers (CLI Subprocesses)
   // =========================================================================
-  Process {
-    id: bluetuiProc
-    command: ["foot", "--app-id=org.hinchley.bluetui", "-e", "bluetui"]
-    running: false
-  }
+  TuiProcess { id: bluetuiProc; appId: "bluetui"; program: ["bluetui"] }
+  TuiProcess { id: btopProc;    appId: "btop";    program: ["btop"] }
+  TuiProcess { id: duaProc;     appId: "dua";     program: ["dua", "i", "/"] }
+  TuiProcess { id: impalaProc;  appId: "impala";  program: ["impala"] }
+  TuiProcess { id: stuiProc;    appId: "stui";    program: ["s-tui"] }
+  TuiProcess { id: wiremixProc; appId: "wiremix"; program: ["wiremix"] }
 
-  Process {
-    id: btopProc
-    command: ["foot", "--app-id=org.hinchley.btop", "-e", "btop"]
-    running: false
-  }
+  FileView {
+    id: cpuStat
+    path: "/proc/stat"
+    onLoaded: {
+      var parts = text().split("\n")[0].trim().split(/\s+/).slice(1).map(n => parseInt(n) || 0);
+      // user nice system idle iowait irq softirq steal
+      var idle = parts[3] + parts[4];
+      var total = parts.slice(0, 8).reduce((sum, n) => sum + n, 0);
 
-  Process {
-    id: duaProc
-    command: ["foot", "--app-id=org.hinchley.dua", "-e", "dua", "i", "/"]
-    running: false
-  }
-
-  Process {
-    id: impalaProc
-    command: ["foot", "--app-id=org.hinchley.impala", "-e", "impala"]
-    running: false
-  }
-
-  Process {
-    id: stuiProc
-    command: ["foot", "--app-id=org.hinchley.stui", "-e", "s-tui"]
-    running: false
-  }
-
-  Process {
-    id: wiremixProc
-    command: ["foot", "--app-id=org.hinchley.wiremix", "-e", "wiremix"]
-    running: false
-  }
-
-  Process {
-    id: commandLauncher
-    running: false
-  }
-
-  Process {
-    id: cpuProc
-    command: ["sh", "-c", "head -1 /proc/stat"]
-    running: true
-    stdout: SplitParser {
-      onRead: data => {
-        if (!data) return;
-        var parts = data.trim().split(/\s+/);
-        var user    = parseInt(parts[1]) || 0;
-        var nice    = parseInt(parts[2]) || 0;
-        var system  = parseInt(parts[3]) || 0;
-        var idle    = parseInt(parts[4]) || 0;
-        var iowait  = parseInt(parts[5]) || 0;
-        var irq     = parseInt(parts[6]) || 0;
-        var softirq = parseInt(parts[7]) || 0;
-        var steal   = parseInt(parts[8]) || 0;
-
-        var idleTime = idle + iowait;
-        var total = user + nice + system + idleTime + irq + softirq + steal;
-
-        if (root.lastCpuTotal > 0) {
-          var dTotal = total - root.lastCpuTotal;
-          var dIdle = idleTime - root.lastCpuIdle;
-          if (dTotal > 0) {
-            root.cpuUsage = Math.round(100 * (dTotal - dIdle) / dTotal);
-          }
-        }
-
-        root.lastCpuTotal = total;
-        root.lastCpuIdle = idleTime;
+      if (root.lastCpuTotal > 0 && total > root.lastCpuTotal) {
+        var dTotal = total - root.lastCpuTotal;
+        var dIdle = idle - root.lastCpuIdle;
+        root.cpuUsage = Math.round(100 * (dTotal - dIdle) / dTotal);
       }
+
+      root.lastCpuTotal = total;
+      root.lastCpuIdle = idle;
+    }
+  }
+
+  FileView {
+    id: memInfo
+    path: "/proc/meminfo"
+    onLoaded: {
+      var total = parseInt(/MemTotal:\s+(\d+)/.exec(text())?.[1]) || 1;
+      var available = parseInt(/MemAvailable:\s+(\d+)/.exec(text())?.[1]) || 0;
+      root.memUsage = Math.round(100 * (total - available) / total);
     }
   }
 
@@ -418,29 +729,13 @@ ShellRoot {
   }
 
   Process {
-    id: memProc
-    command: ["sh", "-c", "free | grep '^Mem'"]
-    running: true
-    stdout: SplitParser {
-      onRead: data => {
-        if (!data) return;
-        var parts = data.trim().split(/\s+/);
-        var total = parseInt(parts[1]) || 1;
-        var available = parseInt(parts[6]) || 0;
-        root.memUsage = Math.round(100 * (total - available) / total);
-      }
-    }
-  }
-
-  Process {
     id: diskProc
-    command: ["sh", "-c", "df / | tail -1"]
+    command: ["df", "--output=pcent", "/"]
     running: true
     stdout: SplitParser {
       onRead: data => {
-        if (!data) return;
-        var parts = data.trim().split(/\s+/);
-        root.diskUsage = parseInt((parts[4] || "0%").replace('%', '')) || 0;
+        // Skips the "Use%" header line.
+        if (/^\s*\d+%/.test(data)) root.diskUsage = parseInt(data);
       }
     }
   }
@@ -478,17 +773,36 @@ ShellRoot {
     }
   }
 
+  // Lists every hl.bind() in the Hyprland config (see scripts/keybinds.lua).
+  Process {
+    id: keybindProc
+    command: ["lua", root.scriptDir + "/keybinds.lua", root.hyprConfig]
+    stdout: StdioCollector {
+      onStreamFinished: root.keybindList = root.parseKeybinds(text)
+    }
+    stderr: StdioCollector {
+      onStreamFinished: if (text) console.warn("keybinds.lua: " + text.trim())
+    }
+  }
+
   // Polling Event Hooks
   Timer {
     interval: 2000
     repeat: true
     running: true
+    triggeredOnStart: true
     onTriggered: {
-      cpuProc.running = true;
+      cpuStat.reload();
+      memInfo.reload();
       cpuTempProc.running = true;
-      memProc.running = true;
-      diskProc.running = true;
     }
+  }
+
+  Timer {
+    interval: 30000
+    repeat: true
+    running: true
+    onTriggered: diskProc.running = true
   }
 
   Timer {
@@ -516,15 +830,26 @@ ShellRoot {
 
   IpcHandler {
     target: "launcher"
-    function open(): void {
-      root.openLauncher();
-    }
-    function close(): void {
-      root.closeLauncher();
-    }
-    function toggle(): void {
-      root.toggleLauncher();
-    }
+    function open(): void { root.openOverlay("launcher"); }
+    function close(): void { root.closeOverlay(); }
+    function toggle(): void { root.toggleOverlay("launcher"); }
+  }
+
+  IpcHandler {
+    target: "keybinds"
+    function open(): void { root.openOverlay("keybinds"); }
+    function close(): void { root.closeOverlay(); }
+    function toggle(): void { root.toggleOverlay("keybinds"); }
+  }
+
+  IpcHandler {
+    target: "bar"
+    function toggle(): void { root.barVisible = !root.barVisible; }
+  }
+
+  IpcHandler {
+    target: "calendar"
+    function toggle(): void { root.toggleCalendar(); }
   }
 
   // =========================================================================
@@ -539,7 +864,7 @@ ShellRoot {
       id: bar
       required property var modelData
       screen: modelData
-      visible: true
+      visible: root.barVisible
       implicitHeight: 42
       color: "transparent"
       anchors {
@@ -576,7 +901,7 @@ ShellRoot {
 
                 BarText {
                   text: delegateItem.index + 1
-                  color: delegateItem.isActive ? root.colCyan : (delegateItem.workspace ? root.colCyan : root.colMuted)
+                  color: (delegateItem.isActive || delegateItem.workspace) ? root.colCyan : root.colMuted
                   font.bold: true
                   anchors.centerIn: parent
                 }
@@ -667,19 +992,11 @@ ShellRoot {
           mouse.onClicked: root.toggleCalendar()
 
           BarText {
-            id: clockLabel
-            text: Qt.formatDateTime(new Date(), "ddd MMM dd HH:mm")
+            text: Qt.formatDateTime(clock.date, "ddd MMM dd HH:mm")
             color: root.colCyan
             font.bold: true
             font.features: {
               "tnum": true
-            }
-
-            Timer {
-              interval: 1000
-              running: true
-              repeat: true
-              onTriggered: clockLabel.text = Qt.formatDateTime(new Date(), "ddd MMM dd HH:mm")
             }
           }
         }
@@ -802,7 +1119,6 @@ ShellRoot {
                 }
 
                 MouseArea {
-                  id: trayMA
                   anchors.fill: parent
                   acceptedButtons: Qt.LeftButton | Qt.RightButton
                   onClicked: mouse => {
@@ -888,13 +1204,13 @@ ShellRoot {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.calendarBaseDate = new Date(root.calendarYear, root.calendarMonth - 1, 1)
+                  onClicked: root.showCalendarMonth(root.calendarYear, root.calendarMonth - 1)
                 }
               }
 
               BarText {
                 Layout.fillWidth: true
-                text: root.calendarBaseDate.toLocaleDateString(Qt.locale(), "MMMM yyyy")
+                text: new Date(root.calendarYear, root.calendarMonth, 1).toLocaleDateString(Qt.locale(), "MMMM yyyy")
                 color: root.colCyan
                 horizontalAlignment: Text.AlignHCenter
                 font.pixelSize: root.fontSize + 2
@@ -921,7 +1237,7 @@ ShellRoot {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.calendarBaseDate = new Date(root.calendarYear, root.calendarMonth + 1, 1)
+                  onClicked: root.showCalendarMonth(root.calendarYear, root.calendarMonth + 1)
                 }
               }
             }
@@ -952,7 +1268,7 @@ ShellRoot {
               columnSpacing: 4
               rowSpacing: 4
               Repeater {
-                model: root.generateCalendarDays(root.calendarYear, root.calendarMonth)
+                model: root.generateCalendarDays(root.calendarYear, root.calendarMonth, clock.date)
                 delegate: Rectangle {
                   id: day
                   required property var modelData
@@ -977,254 +1293,32 @@ ShellRoot {
           }
         }
       }
-
-      IpcHandler {
-        target: "bar"
-        function toggle(): void {
-          calendarPopup.visible = !calendarPopup.visible;
-        }
-      }
     }
   }
 
-  // Standard Panel Capsule Item
-  component Pill: Rectangle {
-    id: pill
-    default property alias content: pillLayout.children
-    property real spacing: 4
-    property real sidePadding: 30
-    property alias mouse: pillMouseArea
-
-    color: root.colPill
-    radius: 12
-    implicitHeight: 28
-    border.color: root.colBorderFaint
-    border.width: 1
-    implicitWidth: pillLayout.implicitWidth + sidePadding
-
-    RowLayout {
-      id: pillLayout
-      spacing: pill.spacing
-      anchors {
-        fill: parent
-        leftMargin: pill.sidePadding / 2
-        rightMargin: pill.sidePadding / 2
-      }
-    }
-
-    MouseArea {
-      id: pillMouseArea
-      anchors.fill: parent
-      enabled: false
-    }
-  }
-
-  component MetricPill: Pill {
-    id: metricPill
-    property string label
-    property color labelColor: root.colFg
-    signal clicked()
-
-    mouse.enabled: true
-    mouse.cursorShape: Qt.PointingHandCursor
-    mouse.onClicked: clicked()
-
-    BarText {
-      text: metricPill.label
-      color: metricPill.labelColor
-      font.bold: true
-    }
-  }
 
   // =========================================================================
-  // 8. Unmanaged Floating Launcher Surface Layer
+  // 8. Floating Overlays (App Launcher & Keybind Search)
   // =========================================================================
-  // qmllint disable uncreatable-type
-  PanelWindow {
-    // qmllint enable uncreatable-type
+  PickerWindow {
     id: launcherWindow
-    visible: root.launcherOpen
+    open: root.launcherOpen
+    placeholder: "Run"
+    entries: root.launcherEntries(query)
+    onActivated: entry => root.launchEntry(entry)
+    onDismissed: root.closeOverlay()
+  }
 
-    // Native Wayland Layer Shell specifications for Quickshell 0.3.0
-    WlrLayershell.layer: WlrLayer.Overlay
-    focusable: true
-    color: "transparent"
-    anchors {
-      top: true
-      bottom: true
-      left: true
-      right: true
-    }
-
-    // Safe full-screen transparent bounding box click-dismiss handler
-    MouseArea {
-      anchors.fill: parent
-      onClicked: root.closeLauncher()
-    }
-
-    onVisibleChanged: {
-      if (visible) {
-        launcherInput.forceActiveFocus();
-        launcherList.currentIndex = launcherList.count > 0 ? 0 : -1;
-      }
-    }
-
-    function launchSelected() {
-      if (launcherList.currentIndex < 0) return;
-      root.launchEntry(launcherFiltered.values[launcherList.currentIndex]);
-    }
-
-    // Centered Content Framework Layout Container Box
-    Rectangle {
-      anchors.centerIn: parent
-      width: 560
-      height: 420
-      color: root.colPill
-      radius: 10
-      border.color: root.colBorderStrong
-      border.width: 1
-
-      // Block click-propagation to prevent overlay dismiss action inside the container
-      MouseArea {
-        anchors.fill: parent
-        onClicked: mouse => mouse.accepted = true
-      }
-
-      ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 14
-        spacing: 10
-
-        Rectangle {
-          Layout.fillWidth: true
-          Layout.preferredHeight: 42
-          radius: 10
-          color: root.colFillInput
-          border.color: launcherInput.activeFocus ? root.colCyan : root.colBorderMed
-          border.width: 1
-
-          TextField {
-            id: launcherInput
-            anchors.fill: parent
-            anchors.leftMargin: 12
-            anchors.rightMargin: 12
-            text: root.launcherQuery
-            placeholderText: "Run"
-            color: root.colFg
-            placeholderTextColor: root.colMuted
-            selectionColor: root.colCyan
-            selectedTextColor: root.colBg
-            font.family: root.fontFamily
-            font.pixelSize: root.fontSize + 3
-            padding: 0
-            verticalAlignment: TextInput.AlignVCenter
-            background: Rectangle {
-              color: "transparent"
-            }
-
-            onTextChanged: {
-              root.launcherQuery = text;
-              Qt.callLater(() => launcherList.currentIndex = launcherList.count > 0 ? 0 : -1);
-            }
-
-            Keys.onEscapePressed: root.closeLauncher()
-            Keys.onPressed: event => {
-              var ctrl = event.modifiers & Qt.ControlModifier;
-              if (event.key === Qt.Key_Up || (event.key === Qt.Key_P && ctrl)) {
-                event.accepted = true;
-                if (launcherList.currentIndex > 0) {
-                  launcherList.currentIndex--;
-                }
-              } else if (event.key === Qt.Key_Down || (event.key === Qt.Key_N && ctrl)) {
-                event.accepted = true;
-                if (launcherList.currentIndex < launcherList.count - 1) {
-                  launcherList.currentIndex++;
-                }
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                event.accepted = true;
-                launcherWindow.launchSelected();
-              } else if (event.key === Qt.Key_C && ctrl) {
-                event.accepted = true;
-                root.closeLauncher();
-              }
-            }
-          }
-        }
-
-        ScriptModel {
-          id: launcherFiltered
-          values: root.launcherEntries()
-          onValuesChanged: Qt.callLater(() => launcherList.currentIndex = launcherList.count > 0 ? 0 : -1)
-        }
-
-        ListView {
-          id: launcherList
-          Layout.fillWidth: true
-          Layout.fillHeight: true
-          clip: true
-          model: launcherFiltered.values
-          currentIndex: count > 0 ? 0 : -1
-          keyNavigationWraps: true
-          boundsBehavior: Flickable.StopAtBounds
-          highlightMoveDuration: 80
-          highlight: Rectangle {
-            radius: 8
-            color: Qt.rgba(root.colCyan.r, root.colCyan.g, root.colCyan.b, 0.18)
-            border.color: Qt.rgba(root.colCyan.r, root.colCyan.g, root.colCyan.b, 0.28)
-            border.width: 1
-          }
-
-          delegate: Item {
-            id: launcherEntry
-            required property var modelData
-            required property int index
-            width: ListView.view.width
-            height: 46
-
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: launcherList.currentIndex = launcherEntry.index
-              onDoubleClicked: launcherWindow.launchSelected()
-            }
-
-            Column {
-              spacing: 2
-              anchors {
-                left: parent.left
-                right: parent.right
-                verticalCenter: parent.verticalCenter
-                leftMargin: 12
-                rightMargin: 12
-              }
-
-              BarText {
-                width: parent.width
-                text: launcherEntry.modelData.name
-                color: launcherEntry.ListView.isCurrentItem ? root.colCyan : root.colFg
-                font.pixelSize: root.fontSize + 1
-                font.bold: launcherEntry.ListView.isCurrentItem
-                elide: Text.ElideRight
-                maximumLineCount: 1
-              }
-            }
-          }
-
-          Keys.onEscapePressed: root.closeLauncher()
-          Keys.onReturnPressed: launcherWindow.launchSelected()
-          Keys.onEnterPressed: launcherWindow.launchSelected()
-        }
-
-        BarText {
-          visible: launcherFiltered.values.length === 0
-          Layout.fillWidth: true
-          text: "No matches"
-          color: root.colMuted
-          horizontalAlignment: Text.AlignHCenter
-          font.bold: true
-        }
-      }
-    }
+  PickerWindow {
+    id: keybindsWindow
+    open: root.keybindsOpen
+    placeholder: "Search keyboard shortcuts"
+    entries: root.keybindEntries(query)
+    primaryRole: "keys"
+    secondaryRole: "description"
+    primaryWidth: 260
+    panelWidth: 900
+    panelHeight: 520
+    onDismissed: root.closeOverlay()
   }
 }
