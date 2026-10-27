@@ -10,6 +10,7 @@ import Quickshell.Io
 import Quickshell.Services.Mpris
 import Quickshell.Services.Pipewire
 import Quickshell.Services.SystemTray
+import Quickshell.Services.UPower
 import Quickshell.Wayland
 
 ShellRoot {
@@ -38,12 +39,11 @@ ShellRoot {
   property color colFillInput:    Qt.rgba(1, 1, 1, 0.035)
   property color colFillHover:    Qt.rgba(1, 1, 1, 0.08)
 
-  property string fontFamily: "JetBrainsMono Nerd Font"
+  property string fontFamily: "IoskeleyMonoTerm Nerd Font Mono"
   property int fontSize: 13
 
-  // Network Interfaces
-  property string ethInterface:  "eno1"
-  property string wlanInterface: "wlan0"
+  // Desktop wallpaper (also used by hyprlock). Replace the file (or symlink) to change it.
+  readonly property string wallpaper: Quickshell.env("HOME") + "/.config/backgrounds/background.png"
 
   readonly property string scriptDir: Quickshell.shellDir + "/scripts"
   readonly property string hyprConfig: Quickshell.env("HOME") + "/.config/hypr/hyprland.lua"
@@ -91,6 +91,7 @@ ShellRoot {
     "Limine",
     "Manage Printing",
     "QT",
+    "Qt V4L2",
     "uuctl",
     "UXterm",
     "Vim",
@@ -641,6 +642,22 @@ ShellRoot {
   PwObjectTracker {
     objects: [Pipewire.defaultAudioSink]
   }
+  // Battery (laptops): UPower's display device aggregates all batteries. Hidden when there is no battery.
+  readonly property var battery: UPower.displayDevice
+  readonly property bool hasBattery: (battery?.isLaptopBattery ?? false) && (battery?.ready ?? true)
+  readonly property int batteryPercent: Math.round((battery?.percentage ?? 0) <= 1 ? (battery?.percentage ?? 0) * 100 : battery.percentage)
+  readonly property bool charging: battery?.state === UPowerDeviceState.Charging || battery?.state === UPowerDeviceState.FullyCharged
+  readonly property string batteryIcon: {
+    if (charging) return "\u{f0084}";
+    var icons = ["\u{f008e}", "\u{f007a}", "\u{f007b}", "\u{f007c}", "\u{f007d}", "\u{f007e}",
+                 "\u{f007f}", "\u{f0080}", "\u{f0081}", "\u{f0082}", "\u{f0079}"];
+    return icons[Math.max(0, Math.min(10, Math.round(batteryPercent / 10)))];
+  }
+  readonly property color batteryColor: charging ? colGreen : (batteryPercent <= 15 ? colRed : (batteryPercent <= 30 ? colYellow : colGreen))
+
+  // Notifications: mako's do-not-disturb mode (SUPER+CTRL+COMMA or click the bell).
+  property bool dndEnabled: false
+
   readonly property var sink: Pipewire.defaultAudioSink
   readonly property int volumeLevel: Math.round((sink?.audio?.volume ?? 0) * 100)
   readonly property bool isMuted: sink?.audio?.muted ?? false
@@ -682,7 +699,6 @@ ShellRoot {
   TuiProcess { id: btopProc;    appId: "btop";    program: ["btop"] }
   TuiProcess { id: duaProc;     appId: "dua";     program: ["dua", "i", "/"] }
   TuiProcess { id: impalaProc;  appId: "impala";  program: ["impala"] }
-  TuiProcess { id: stuiProc;    appId: "stui";    program: ["s-tui"] }
   TuiProcess { id: wiremixProc; appId: "wiremix"; program: ["wiremix"] }
 
   FileView {
@@ -755,7 +771,7 @@ ShellRoot {
 
   Process {
     id: netProc
-    command: ["sh", root.scriptDir + "/net-status.sh", root.ethInterface, root.wlanInterface]
+    command: ["sh", root.scriptDir + "/net-status.sh"]
     running: true
     stdout: SplitParser {
       onRead: data => {
@@ -771,6 +787,22 @@ ShellRoot {
         }
       }
     }
+  }
+
+  // mako do-not-disturb: read the current mode list, toggle on click.
+  Process {
+    id: dndProc
+    command: ["makoctl", "mode"]
+    running: true
+    stdout: StdioCollector {
+      onStreamFinished: root.dndEnabled = text.split("\n").indexOf("do-not-disturb") >= 0
+    }
+  }
+
+  Process {
+    id: dndToggleProc
+    command: ["makoctl", "mode", "-t", "do-not-disturb"]
+    onExited: dndProc.running = true
   }
 
   // Lists every hl.bind() in the Hyprland config (see scripts/keybinds.lua).
@@ -809,7 +841,10 @@ ShellRoot {
     interval: 5000
     repeat: true
     running: true
-    onTriggered: netProc.running = true
+    onTriggered: {
+      netProc.running = true;
+      dndProc.running = true;   // picks up changes made with the keyboard shortcut
+    }
   }
 
   Connections {
@@ -853,7 +888,41 @@ ShellRoot {
   }
 
   // =========================================================================
-  // 7. Status Bar Component Matrix
+  // 7. Wallpaper (one background-layer window per screen; replaces swaybg)
+  // =========================================================================
+  Variants {
+    model: Quickshell.screens
+
+    // qmllint disable uncreatable-type
+    PanelWindow {
+      // qmllint enable uncreatable-type
+      required property var modelData
+      screen: modelData
+      WlrLayershell.layer: WlrLayer.Background
+      WlrLayershell.namespace: "wallpaper"
+      exclusionMode: ExclusionMode.Ignore
+      color: root.colBg
+      anchors {
+        top: true
+        bottom: true
+        left: true
+        right: true
+      }
+
+      Image {
+        anchors.fill: parent
+        source: "file://" + root.wallpaper
+        fillMode: Image.PreserveAspectCrop
+        asynchronous: true
+        smooth: true
+        sourceSize.width: parent.width     // decode at screen size, not the 7680px source
+        sourceSize.height: parent.height
+      }
+    }
+  }
+
+  // =========================================================================
+  // 8. Status Bar Component Matrix
   // =========================================================================
   Variants {
     model: Quickshell.screens
@@ -866,6 +935,9 @@ ShellRoot {
       screen: modelData
       visible: root.barVisible
       implicitHeight: 42
+      // Narrow screens (e.g. a scaled laptop panel) drop the DND pill and network name so the
+      // right section doesn't run into the clock. Logical pixels, so scaling is accounted for.
+      readonly property bool compact: modelData.width < 1920
       color: "transparent"
       anchors {
         top: true
@@ -1051,8 +1123,9 @@ ShellRoot {
             labelColor: root.colBlue
             onClicked: impalaProc.running = true
             label: {
-              if (root.netType === "wifi") return "󰤨 " + root.netName;
-              if (root.netType === "ethernet") return "󰈀 " + root.netName;
+              var name = bar.compact ? "" : " " + root.netName;
+              if (root.netType === "wifi") return "󰤨" + name;
+              if (root.netType === "ethernet") return "󰈀" + name;
               return "offline";
             }
           }
@@ -1084,7 +1157,20 @@ ShellRoot {
           MetricPill {
             label: " " + root.cpuTemp + (root.cpuTemp === "--" ? "" : "°C")
             labelColor: root.colRed
-            onClicked: stuiProc.running = true
+            onClicked: btopProc.running = true
+          }
+
+          MetricPill {
+            visible: root.hasBattery
+            label: root.batteryIcon + " " + root.batteryPercent + "%"
+            labelColor: root.batteryColor
+          }
+
+          MetricPill {
+            visible: !bar.compact
+            label: root.dndEnabled ? "\u{f009b}" : "\u{f009a}"
+            labelColor: root.dndEnabled ? root.colMuted : root.colPurple
+            onClicked: dndToggleProc.running = true
           }
 
           Pill {
@@ -1298,7 +1384,7 @@ ShellRoot {
 
 
   // =========================================================================
-  // 8. Floating Overlays (App Launcher & Keybind Search)
+  // 9. Floating Overlays (App Launcher & Keybind Search)
   // =========================================================================
   PickerWindow {
     id: launcherWindow
